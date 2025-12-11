@@ -4,8 +4,10 @@ import re
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Border, Side, Alignment, Font
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.dataframe import dataframe_to_rows
 
 # ───── Streamlit setup ────────────────────────────────────────────────────────
 st.set_page_config(page_title="Visitor List Cleaner (US)", layout="wide")
@@ -36,12 +38,13 @@ st.markdown(
 
 # ───── Download Sample Template ───────────────────────────────────────────────
 with open("US_Template.xlsx", "rb") as f:
-    st.download_button(
-        label="⬇️ Download US Template",
-        data=f,
-        file_name="US_Template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    sample_bytes = f.read()
+st.download_button(
+    label="⬇️ Download US Template",
+    data=sample_bytes,
+    file_name="US_Template.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
 
 # ───── 4) Estimate Clearance Date ───────────────────────────────────────────────
 US_EASTERN = ZoneInfo("America/New_York")
@@ -139,7 +142,7 @@ def clean_data_us(df: pd.DataFrame) -> pd.DataFrame:
     # 2) Drop rows where all of Full Name → Mobile are blank
     df = df.dropna(subset=df.columns[3:10], how="all")
 
-    # 3) Normalize nationality (incl. Indian → India, etc.)
+    # 3) Normalize nationality
     nat_map = {
         "chinese":     "China",
         "singaporean": "Singapore",
@@ -198,88 +201,103 @@ def clean_data_us(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# ───── Build & style the single-sheet Excel ──────────────────────────────────
-def generate_visitor_only_us(df: pd.DataFrame):
+# ───── Build & style Excel while PRESERVING other sheets ─────────────────────
+def generate_visitor_only_us(df: pd.DataFrame, uploaded_file) -> tuple[BytesIO, bool]:
     buf = BytesIO()
     has_errors = False  # track if any cell is highlighted red
 
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Visitor List")
-        ws = writer.sheets["Visitor List"]
+    # Reload original workbook so all other sheets are preserved
+    uploaded_file.seek(0)
+    wb = load_workbook(uploaded_file)
 
-        # styling objects
-        header_fill  = PatternFill("solid", fgColor="94B455")
-        border       = Border(Side("thin"), Side("thin"), Side("thin"), Side("thin"))
-        center       = Alignment("center", "center")
-        normal_font  = Font(name="Calibri", size=9)
-        bold_font    = Font(name="Calibri", size=9, bold=True)
-        invalid_fill = PatternFill("solid", fgColor="E6B8B7")  # light red
+    # Get or create Visitor List sheet
+    if "Visitor List" in wb.sheetnames:
+        ws = wb["Visitor List"]
+        # Clear existing contents
+        ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet("Visitor List")
 
-        # 1) Apply borders, alignment, font
-        for row in ws.iter_rows():
-            for cell in row:
-                cell.border    = border
-                cell.alignment = center
-                cell.font      = normal_font
+    # Write DataFrame to Visitor List sheet
+    for row in dataframe_to_rows(df, index=False, header=True):
+        ws.append(row)
 
-        # 2) Style header row
-        for col in range(1, ws.max_column + 1):
-            h = ws[f"{get_column_letter(col)}1"]
-            h.fill = header_fill
-            h.font = bold_font
+    # styling objects
+    header_fill  = PatternFill("solid", fgColor="94B455")
+    border       = Border(Side("thin"), Side("thin"), Side("thin"), Side("thin"))
+    center       = Alignment("center", "center")
+    normal_font  = Font(name="Calibri", size=9)
+    bold_font    = Font(name="Calibri", size=9, bold=True)
+    invalid_fill = PatternFill("solid", fgColor="E6B8B7")  # light red
 
-        # 3) Freeze top row
-        ws.freeze_panes = ws["A2"]
+    # 1) Apply borders, alignment, font
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border    = border
+            cell.alignment = center
+            cell.font      = normal_font
 
-        # 4) Auto-fit columns & set row height
-        for col in ws.columns:
-            w = max(len(str(cell.value)) for cell in col if cell.value)
-            ws.column_dimensions[get_column_letter(col[0].column)].width = w + 2
-        for row in ws.iter_rows():
-            ws.row_dimensions[row[0].row].height = 20
+    # 2) Style header row
+    for col in range(1, ws.max_column + 1):
+        h = ws[f"{get_column_letter(col)}1"]
+        h.fill = header_fill
+        h.font = bold_font
 
-        # 5) Highlight invalid Driver License Number (Column G) cells
-        dl_col_idx = 7  # Column G is the 7th column
-        dl_pattern = re.compile(r"^\d{4}$")
+    # 3) Freeze top row
+    ws.freeze_panes = "A2"
 
-        for r in range(2, ws.max_row + 1):  # skip header row
-            cell = ws.cell(row=r, column=dl_col_idx)
-            value = str(cell.value).strip() if cell.value is not None else ""
-            if not dl_pattern.match(value):
-                cell.fill = invalid_fill
-                has_errors = True
+    # 4) Auto-fit columns & set row height
+    for col in ws.columns:
+        values = [len(str(cell.value)) for cell in col if cell.value is not None]
+        width = max(values) if values else 10
+        ws.column_dimensions[get_column_letter(col[0].column)].width = width + 2
+    for row in ws.iter_rows():
+        ws.row_dimensions[row[0].row].height = 20
 
-        # 6) Highlight blank cells in Column F (Middle and Last Name)
-        col_f_idx = 6  # Column F
-        for r in range(2, ws.max_row + 1):
-            cell = ws.cell(row=r, column=col_f_idx)
-            value = str(cell.value).strip() if cell.value not in (None, "") else ""
-            if value == "":
-                cell.fill = invalid_fill
-                has_errors = True
+    # 5) Highlight invalid Driver License Number (Column G)
+    dl_col_idx = 7  # Column G is the 7th column
+    dl_pattern = re.compile(r"^\d{4}$")
 
-        # 7) Vehicles summary
-        plates = []
-        for v in df["Vehicle Plate Number"].dropna():
-            plates += [x.strip() for x in str(v).split(";") if x.strip()]
-        ins = ws.max_row + 2
-        if plates:
-            ws[f"B{ins}"].value     = "Vehicles"
-            ws[f"B{ins}"].border    = border
-            ws[f"B{ins}"].alignment = center
-            ws[f"B{ins+1}"].value   = ";".join(sorted(set(plates)))
-            ws[f"B{ins+1}"].border  = border
-            ws[f"B{ins+1}"].alignment = center
-            ins += 2
+    for r in range(2, ws.max_row + 1):  # skip header row
+        cell = ws.cell(row=r, column=dl_col_idx)
+        value = str(cell.value).strip() if cell.value is not None else ""
+        if not dl_pattern.match(value):
+            cell.fill = invalid_fill
+            has_errors = True
 
-        # 8) Total Visitors
-        ws[f"B{ins}"].value     = "Total Visitors"
+    # 6) Highlight blank cells in Column F (Middle and Last Name)
+    col_f_idx = 6  # Column F
+    for r in range(2, ws.max_row + 1):
+        cell = ws.cell(row=r, column=col_f_idx)
+        value = str(cell.value).strip() if cell.value not in (None, "") else ""
+        if value == "":
+            cell.fill = invalid_fill
+            has_errors = True
+
+    # 7) Vehicles summary
+    plates = []
+    for v in df["Vehicle Plate Number"].dropna():
+        plates += [x.strip() for x in str(v).split(";") if x.strip()]
+    ins = ws.max_row + 2
+    if plates:
+        ws[f"B{ins}"].value     = "Vehicles"
         ws[f"B{ins}"].border    = border
         ws[f"B{ins}"].alignment = center
-        ws[f"B{ins+1}"].value   = df["Company Full Name"].notna().sum()
+        ws[f"B{ins+1}"].value   = ";".join(sorted(set(plates)))
         ws[f"B{ins+1}"].border  = border
         ws[f"B{ins+1}"].alignment = center
+        ins += 2
 
+    # 8) Total Visitors
+    ws[f"B{ins}"].value     = "Total Visitors"
+    ws[f"B{ins}"].border    = border
+    ws[f"B{ins}"].alignment = center
+    ws[f"B{ins+1}"].value   = df["Company Full Name"].notna().sum()
+    ws[f"B{ins+1}"].border  = border
+    ws[f"B{ins+1}"].alignment = center
+
+    # Save full workbook (all sheets) to buffer
+    wb.save(buf)
     buf.seek(0)
     return buf, has_errors
 
@@ -288,7 +306,7 @@ uploaded = st.file_uploader("📁 Upload File", type=["xlsx"])
 if uploaded:
     raw_df = pd.read_excel(uploaded, sheet_name="Visitor List")
     cleaned = clean_data_us(raw_df)
-    out_buf, has_errors = generate_visitor_only_us(cleaned)
+    out_buf, has_errors = generate_visitor_only_us(cleaned, uploaded)
 
     # Status message based on validation
     if has_errors:
@@ -341,3 +359,4 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
